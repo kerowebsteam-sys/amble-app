@@ -13,12 +13,14 @@ import {
   FileText,
   Upload,
   Link as LinkIcon,
-  Image as ImageIcon,
+  Wallet,
+  Users,
+  LogOut,
 } from "lucide-react";
+import { supabase } from "./supabaseClient";
 
 const COLORS = {
   teal: "#0F6E56",
-  tealDeep: "#0B5443",
   charcoal: "#2C2C2A",
   sand: "#E8DDC8",
   terracotta: "#C1652F",
@@ -26,47 +28,7 @@ const COLORS = {
   warmgray: "#8B8880",
 };
 
-// --- IndexedDB helpers for storing uploaded files locally in the browser ---
-function openFileDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open("ambleFilesDB", 1);
-    req.onupgradeneeded = () => {
-      req.result.createObjectStore("files", { keyPath: "id" });
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-async function saveFileBlob(id, blob, name, type) {
-  const db = await openFileDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction("files", "readwrite");
-    tx.objectStore("files").put({ id, blob, name, type });
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-async function getFileBlob(id) {
-  const db = await openFileDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction("files", "readonly");
-    const req = tx.objectStore("files").get(id);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-async function deleteFileBlob(id) {
-  const db = await openFileDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction("files", "readwrite");
-    tx.objectStore("files").delete(id);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
 const SEASON = (month) => {
-  // Cape Town seasonality: Nov-Mar peak, Apr & Oct shoulder, May-Sep off-peak
   if ([10, 11, 0, 1, 2].includes(month)) return { label: "Peak", mult: 1.3 };
   if ([3, 9].includes(month)) return { label: "Shoulder", mult: 1.0 };
   return { label: "Off-peak", mult: 0.75 };
@@ -86,22 +48,27 @@ const MONTHS = [
   "November",
   "December",
 ];
-
-function uid() {
-  return Math.random().toString(36).slice(2, 10);
-}
+const STAGES = ["new", "contacted", "negotiating", "won", "lost"];
+const STAGE_LABELS = {
+  new: "New",
+  contacted: "Contacted",
+  negotiating: "Negotiating",
+  won: "Won",
+  lost: "Lost",
+};
 
 function calcPricing(property, comps, monthIdx) {
   const relevant = comps.filter(
     (c) =>
-      c.suburb.toLowerCase() === (property.suburb || "").toLowerCase() &&
+      (c.suburb || "").toLowerCase() ===
+        (property.suburb || "").toLowerCase() &&
       Math.abs(Number(c.bedrooms) - Number(property.bedrooms)) <= 1,
   );
   const avgComp = relevant.length
     ? relevant.reduce((s, c) => s + Number(c.price), 0) / relevant.length
     : null;
   const season = SEASON(monthIdx);
-  const base = avgComp || Number(property.currentRate) || 0;
+  const base = avgComp || Number(property.current_rate) || 0;
   const optimal = Math.round(base * season.mult);
   const min = Math.round(optimal * 0.85);
   const max = Math.round(optimal * 1.2);
@@ -127,17 +94,17 @@ function calcPricing(property, comps, monthIdx) {
 
 function scoreListing(s) {
   const photo =
-    s.photoCount >= 20
+    (s.photo_count || 0) >= 20
       ? 25
-      : s.photoCount >= 10
+      : (s.photo_count || 0) >= 10
         ? 18
-        : s.photoCount >= 5
+        : (s.photo_count || 0) >= 5
           ? 10
           : 0;
-  const title = s.titleOptimized ? 20 : 5;
-  const amenity = Math.min(20, (s.amenityCount || 0) * 2);
-  const instant = s.instantBook ? 15 : 0;
-  const response = s.responseUnderHour ? 20 : s.responseUnderDay ? 10 : 0;
+  const title = s.title_optimized ? 20 : 5;
+  const amenity = Math.min(20, (s.amenity_count || 0) * 2);
+  const instant = s.instant_book ? 15 : 0;
+  const response = s.response_under_hour ? 20 : s.response_under_day ? 10 : 0;
   return {
     photo,
     title,
@@ -155,43 +122,70 @@ const NAV = [
   { id: "pricing", label: "Pricing", icon: DollarSign },
   { id: "bookings", label: "Bookings", icon: Calendar },
   { id: "listing", label: "Listing score", icon: TrendingUp },
+  { id: "finance", label: "Finance", icon: Wallet },
+  { id: "sales", label: "Sales pipeline", icon: Users },
 ];
 
 export default function AmbleApp() {
+  const [session, setSession] = useState(undefined); // undefined = loading, null = logged out
   const [tab, setTab] = useState("dashboard");
-  const [loaded, setLoaded] = useState(false);
   const [properties, setProperties] = useState([]);
   const [comps, setComps] = useState([]);
   const [bookings, setBookings] = useState([]);
   const [scores, setScores] = useState({});
   const [documents, setDocuments] = useState([]);
+  const [financeEntries, setFinanceEntries] = useState([]);
+  const [leads, setLeads] = useState([]);
   const [monthIdx, setMonthIdx] = useState(new Date().getMonth());
   const [toast, setToast] = useState(null);
+  const [dataLoaded, setDataLoaded] = useState(false);
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem("amble-app-data");
-      if (raw) {
-        const d = JSON.parse(raw);
-        setProperties(d.properties || []);
-        setComps(d.comps || []);
-        setBookings(d.bookings || []);
-        setScores(d.scores || {});
-        setDocuments(d.documents || []);
-      }
-    } catch (e) {
-      /* no data yet */
-    }
-    setLoaded(true);
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, s) =>
+      setSession(s),
+    );
+    return () => listener.subscription.unsubscribe();
   }, []);
 
   useEffect(() => {
-    if (!loaded) return;
-    const data = { properties, comps, bookings, scores, documents };
-    try {
-      localStorage.setItem("amble-app-data", JSON.stringify(data));
-    } catch (e) {}
-  }, [properties, comps, bookings, scores, documents, loaded]);
+    if (!session) return;
+    loadAll();
+  }, [session]);
+
+  async function loadAll() {
+    const uid = session.user.id;
+    const [p, c, b, s, d, f, l] = await Promise.all([
+      supabase.from("properties").select("*").order("created_at"),
+      supabase.from("comps").select("*"),
+      supabase.from("bookings").select("*"),
+      supabase.from("listing_scores").select("*"),
+      supabase
+        .from("documents")
+        .select("*")
+        .order("added_at", { ascending: false }),
+      supabase
+        .from("finance_entries")
+        .select("*")
+        .order("entry_date", { ascending: false }),
+      supabase
+        .from("sales_leads")
+        .select("*")
+        .order("created_at", { ascending: false }),
+    ]);
+    setProperties(p.data || []);
+    setComps(c.data || []);
+    setBookings(b.data || []);
+    const scoreMap = {};
+    (s.data || []).forEach((row) => {
+      scoreMap[row.property_id] = row;
+    });
+    setScores(scoreMap);
+    setDocuments(d.data || []);
+    setFinanceEntries(f.data || []);
+    setLeads(l.data || []);
+    setDataLoaded(true);
+  }
 
   function showToast(msg) {
     setToast(msg);
@@ -206,6 +200,15 @@ export default function AmbleApp() {
     return map;
   }, [properties, comps, monthIdx]);
 
+  if (session === undefined) {
+    return <div style={{ minHeight: "100vh", background: COLORS.offwhite }} />;
+  }
+  if (!session) {
+    return <AuthScreen />;
+  }
+
+  const userId = session.user.id;
+
   return (
     <div
       style={{
@@ -219,11 +222,9 @@ export default function AmbleApp() {
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
         .amble-display { font-family: 'Fraunces', serif; }
         .amble-nav-btn { transition: all 0.15s ease; }
-        input, select { font-family: 'Inter', sans-serif; }
       `}</style>
 
       <div className="flex min-h-screen">
-        {/* Sidebar */}
         <div
           className="w-56 shrink-0 flex flex-col"
           style={{ background: COLORS.charcoal }}
@@ -265,65 +266,103 @@ export default function AmbleApp() {
               );
             })}
           </nav>
-          <div
-            className="px-5 py-4 text-[11px]"
-            style={{ color: COLORS.warmgray }}
-          >
-            Private internal tool
+          <div className="px-5 py-4">
+            <div
+              className="text-[11px] mb-2 truncate"
+              style={{ color: COLORS.warmgray }}
+            >
+              {session.user.email}
+            </div>
+            <button
+              onClick={() => supabase.auth.signOut()}
+              className="flex items-center gap-2 text-xs"
+              style={{ color: COLORS.warmgray }}
+            >
+              <LogOut size={13} /> Log out
+            </button>
           </div>
         </div>
 
-        {/* Main content */}
         <div className="flex-1 p-8 max-w-5xl">
-          {tab === "dashboard" && (
-            <Dashboard
-              properties={properties}
-              pricingByProperty={pricingByProperty}
-              monthIdx={monthIdx}
-              setMonthIdx={setMonthIdx}
-            />
-          )}
-          {tab === "properties" && (
-            <Properties
-              properties={properties}
-              setProperties={setProperties}
-              showToast={showToast}
-            />
-          )}
-          {tab === "documents" && (
-            <Documents
-              properties={properties}
-              documents={documents}
-              setDocuments={setDocuments}
-              showToast={showToast}
-            />
-          )}
-          {tab === "pricing" && (
-            <Pricing
-              properties={properties}
-              comps={comps}
-              setComps={setComps}
-              monthIdx={monthIdx}
-              setMonthIdx={setMonthIdx}
-              pricingByProperty={pricingByProperty}
-              showToast={showToast}
-            />
-          )}
-          {tab === "bookings" && (
-            <Bookings
-              properties={properties}
-              bookings={bookings}
-              setBookings={setBookings}
-              showToast={showToast}
-            />
-          )}
-          {tab === "listing" && (
-            <ListingScore
-              properties={properties}
-              scores={scores}
-              setScores={setScores}
-              showToast={showToast}
-            />
+          {!dataLoaded ? (
+            <p className="text-sm" style={{ color: COLORS.warmgray }}>
+              Loading your data…
+            </p>
+          ) : (
+            <>
+              {tab === "dashboard" && (
+                <Dashboard
+                  properties={properties}
+                  pricingByProperty={pricingByProperty}
+                  monthIdx={monthIdx}
+                  setMonthIdx={setMonthIdx}
+                />
+              )}
+              {tab === "properties" && (
+                <Properties
+                  properties={properties}
+                  setProperties={setProperties}
+                  userId={userId}
+                  showToast={showToast}
+                />
+              )}
+              {tab === "documents" && (
+                <Documents
+                  properties={properties}
+                  documents={documents}
+                  setDocuments={setDocuments}
+                  userId={userId}
+                  showToast={showToast}
+                />
+              )}
+              {tab === "pricing" && (
+                <Pricing
+                  properties={properties}
+                  comps={comps}
+                  setComps={setComps}
+                  monthIdx={monthIdx}
+                  setMonthIdx={setMonthIdx}
+                  pricingByProperty={pricingByProperty}
+                  userId={userId}
+                  showToast={showToast}
+                />
+              )}
+              {tab === "bookings" && (
+                <Bookings
+                  properties={properties}
+                  bookings={bookings}
+                  setBookings={setBookings}
+                  userId={userId}
+                  showToast={showToast}
+                />
+              )}
+              {tab === "listing" && (
+                <ListingScore
+                  properties={properties}
+                  scores={scores}
+                  setScores={setScores}
+                  userId={userId}
+                  showToast={showToast}
+                />
+              )}
+              {tab === "finance" && (
+                <Finance
+                  properties={properties}
+                  financeEntries={financeEntries}
+                  setFinanceEntries={setFinanceEntries}
+                  userId={userId}
+                  showToast={showToast}
+                />
+              )}
+              {tab === "sales" && (
+                <SalesPipeline
+                  leads={leads}
+                  setLeads={setLeads}
+                  userId={userId}
+                  showToast={showToast}
+                />
+              )}
+            </>
           )}
         </div>
       </div>
@@ -340,12 +379,113 @@ export default function AmbleApp() {
   );
 }
 
+function AuthScreen() {
+  const [mode, setMode] = useState("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    setError("");
+    setBusy(true);
+    const { error } =
+      mode === "signin"
+        ? await supabase.auth.signInWithPassword({ email, password })
+        : await supabase.auth.signUp({ email, password });
+    setBusy(false);
+    if (error) setError(error.message);
+    else if (mode === "signup")
+      setError("Check your email to confirm your account, then log in.");
+  }
+
+  return (
+    <div
+      style={{
+        fontFamily: "Inter, sans-serif",
+        background: COLORS.offwhite,
+        minHeight: "100vh",
+      }}
+      className="flex items-center justify-center"
+    >
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600&display=swap'); .amble-display { font-family: 'Fraunces', serif; }`}</style>
+      <div
+        className="w-full max-w-sm p-8 rounded-lg"
+        style={{ background: "#fff", border: `1px solid ${COLORS.sand}` }}
+      >
+        <div className="flex items-center gap-2 mb-6">
+          <Key size={20} color={COLORS.teal} />
+          <div
+            className="amble-display text-xl"
+            style={{ color: COLORS.charcoal }}
+          >
+            Amble
+          </div>
+        </div>
+        <h2 className="text-sm font-medium mb-4">
+          {mode === "signin" ? "Log in" : "Create your account"}
+        </h2>
+        <div className="space-y-3">
+          <input
+            type="email"
+            placeholder="Email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            className="w-full text-sm px-3 py-2 rounded-md border"
+            style={{ borderColor: COLORS.sand }}
+          />
+          <input
+            type="password"
+            placeholder="Password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            className="w-full text-sm px-3 py-2 rounded-md border"
+            style={{ borderColor: COLORS.sand }}
+          />
+          {error && (
+            <p className="text-xs" style={{ color: COLORS.terracotta }}>
+              {error}
+            </p>
+          )}
+          <button
+            disabled={busy}
+            onClick={submit}
+            className="w-full text-sm py-2 rounded-md"
+            style={{ background: COLORS.teal, color: COLORS.offwhite }}
+          >
+            {busy ? "Please wait…" : mode === "signin" ? "Log in" : "Sign up"}
+          </button>
+        </div>
+        <button
+          onClick={() => setMode(mode === "signin" ? "signup" : "signin")}
+          className="text-xs mt-4"
+          style={{ color: COLORS.warmgray }}
+        >
+          {mode === "signin"
+            ? "No account yet? Sign up"
+            : "Already have an account? Log in"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Card({ children, className = "" }) {
   return (
     <div
       className={`rounded-lg p-5 ${className}`}
       style={{ background: "#FFFFFF", border: `1px solid ${COLORS.sand}` }}
     >
+      {children}
+    </div>
+  );
+}
+function Field({ label, children }) {
+  return (
+    <div>
+      <label className="text-xs block mb-1" style={{ color: COLORS.warmgray }}>
+        {label}
+      </label>
       {children}
     </div>
   );
@@ -374,12 +514,7 @@ function Dashboard({ properties, pricingByProperty, monthIdx, setMonthIdx }) {
     <div>
       <div className="flex items-end justify-between mb-6">
         <div>
-          <h1
-            className="amble-display text-3xl"
-            style={{ color: COLORS.charcoal }}
-          >
-            Portfolio overview
-          </h1>
+          <h1 className="amble-display text-3xl">Portfolio overview</h1>
           <p className="text-sm mt-1" style={{ color: COLORS.warmgray }}>
             {MONTHS[monthIdx]} forecast, based on {properties.length} propert
             {properties.length === 1 ? "y" : "ies"}
@@ -402,8 +537,7 @@ function Dashboard({ properties, pricingByProperty, monthIdx, setMonthIdx }) {
       {properties.length === 0 ? (
         <Card>
           <p className="text-sm" style={{ color: COLORS.warmgray }}>
-            No properties yet. Add your first property to see pricing and
-            revenue forecasts here.
+            No properties yet. Add your first property to see forecasts here.
           </p>
         </Card>
       ) : (
@@ -424,7 +558,6 @@ function Dashboard({ properties, pricingByProperty, monthIdx, setMonthIdx }) {
               value={`R${totalCommission.toLocaleString()}`}
             />
           </div>
-
           {flagged.length > 0 && (
             <Card className="mb-6">
               <div className="flex items-center gap-2 mb-3">
@@ -439,14 +572,13 @@ function Dashboard({ properties, pricingByProperty, monthIdx, setMonthIdx }) {
                     <span>{p.name}</span>
                     <span style={{ color: COLORS.terracotta }}>
                       {(pricingByProperty[p.id]?.occupancy || 0).toFixed(0)}%
-                      projected occupancy
+                      projected
                     </span>
                   </div>
                 ))}
               </div>
             </Card>
           )}
-
           <Card>
             <h3 className="text-sm font-medium mb-3">All properties</h3>
             <div className="space-y-3">
@@ -509,48 +641,63 @@ function StatCard({ label, value, accent }) {
   );
 }
 
-function Properties({ properties, setProperties, showToast }) {
-  const [form, setForm] = useState(emptyProperty());
+function Properties({ properties, setProperties, userId, showToast }) {
+  const empty = {
+    name: "",
+    suburb: "",
+    bedrooms: 1,
+    bathrooms: 1,
+    max_guests: 2,
+    cleaning_fee: "",
+    current_rate: "",
+    listing_url: "",
+  };
+  const [form, setForm] = useState(empty);
   const [editingId, setEditingId] = useState(null);
 
-  function emptyProperty() {
-    return {
-      id: uid(),
-      name: "",
-      suburb: "",
-      bedrooms: 1,
-      bathrooms: 1,
-      maxGuests: 2,
-      cleaningFee: "",
-      currentRate: "",
-      listingUrl: "",
-    };
-  }
-
-  function save() {
+  async function save() {
     if (!form.name || !form.suburb) {
       showToast("Name and suburb are required");
       return;
     }
     if (editingId) {
-      setProperties(properties.map((p) => (p.id === editingId ? form : p)));
+      const { data, error } = await supabase
+        .from("properties")
+        .update(form)
+        .eq("id", editingId)
+        .select()
+        .single();
+      if (error) {
+        showToast("Error saving");
+        return;
+      }
+      setProperties(properties.map((p) => (p.id === editingId ? data : p)));
       showToast("Property updated");
     } else {
-      setProperties([...properties, form]);
+      const { data, error } = await supabase
+        .from("properties")
+        .insert({ ...form, user_id: userId })
+        .select()
+        .single();
+      if (error) {
+        showToast("Error adding");
+        return;
+      }
+      setProperties([...properties, data]);
       showToast("Property added");
     }
-    setForm(emptyProperty());
+    setForm(empty);
     setEditingId(null);
   }
-
   function edit(p) {
     setForm(p);
     setEditingId(p.id);
   }
-  function remove(id) {
+  async function remove(id) {
+    await supabase.from("properties").delete().eq("id", id);
     setProperties(properties.filter((p) => p.id !== id));
     if (editingId === id) {
-      setForm(emptyProperty());
+      setForm(empty);
       setEditingId(null);
     }
   }
@@ -611,9 +758,9 @@ function Properties({ properties, setProperties, showToast }) {
                 <input
                   type="number"
                   min="1"
-                  value={form.maxGuests}
+                  value={form.max_guests}
                   onChange={(e) =>
-                    setForm({ ...form, maxGuests: e.target.value })
+                    setForm({ ...form, max_guests: e.target.value })
                   }
                   className="w-full text-sm px-3 py-2 rounded-md border"
                   style={{ borderColor: COLORS.sand }}
@@ -625,9 +772,9 @@ function Properties({ properties, setProperties, showToast }) {
                 <input
                   type="number"
                   min="0"
-                  value={form.cleaningFee}
+                  value={form.cleaning_fee}
                   onChange={(e) =>
-                    setForm({ ...form, cleaningFee: e.target.value })
+                    setForm({ ...form, cleaning_fee: e.target.value })
                   }
                   className="w-full text-sm px-3 py-2 rounded-md border"
                   style={{ borderColor: COLORS.sand }}
@@ -637,9 +784,9 @@ function Properties({ properties, setProperties, showToast }) {
                 <input
                   type="number"
                   min="0"
-                  value={form.currentRate}
+                  value={form.current_rate}
                   onChange={(e) =>
-                    setForm({ ...form, currentRate: e.target.value })
+                    setForm({ ...form, current_rate: e.target.value })
                   }
                   className="w-full text-sm px-3 py-2 rounded-md border"
                   style={{ borderColor: COLORS.sand }}
@@ -648,9 +795,9 @@ function Properties({ properties, setProperties, showToast }) {
             </div>
             <Field label="Listing URL (reference only)">
               <input
-                value={form.listingUrl}
+                value={form.listing_url}
                 onChange={(e) =>
-                  setForm({ ...form, listingUrl: e.target.value })
+                  setForm({ ...form, listing_url: e.target.value })
                 }
                 className="w-full text-sm px-3 py-2 rounded-md border"
                 style={{ borderColor: COLORS.sand }}
@@ -668,7 +815,7 @@ function Properties({ properties, setProperties, showToast }) {
               {editingId && (
                 <button
                   onClick={() => {
-                    setForm(emptyProperty());
+                    setForm(empty);
                     setEditingId(null);
                   }}
                   className="text-sm px-4 py-2 rounded-md border"
@@ -680,7 +827,6 @@ function Properties({ properties, setProperties, showToast }) {
             </div>
           </div>
         </Card>
-
         <div className="space-y-3">
           {properties.length === 0 && (
             <Card>
@@ -699,13 +845,13 @@ function Properties({ properties, setProperties, showToast }) {
                     style={{ color: COLORS.warmgray }}
                   >
                     {p.suburb} · {p.bedrooms} bed / {p.bathrooms} bath · sleeps{" "}
-                    {p.maxGuests}
+                    {p.max_guests}
                   </div>
                   <div
                     className="text-xs mt-1"
                     style={{ color: COLORS.warmgray }}
                   >
-                    Current rate: R{p.currentRate || "–"}/night
+                    Current rate: R{p.current_rate || "–"}/night
                   </div>
                 </div>
                 <div className="flex gap-2">
@@ -733,304 +879,6 @@ function Properties({ properties, setProperties, showToast }) {
   );
 }
 
-function Field({ label, children }) {
-  return (
-    <div>
-      <label className="text-xs block mb-1" style={{ color: COLORS.warmgray }}>
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}
-
-function Documents({ properties, documents, setDocuments, showToast }) {
-  const [selectedId, setSelectedId] = useState(properties[0]?.id || "");
-  const [docType, setDocType] = useState("photo");
-  const [mode, setMode] = useState("upload"); // 'upload' or 'link'
-  const [label, setLabel] = useState("");
-  const [externalUrl, setExternalUrl] = useState("");
-  const [pendingFile, setPendingFile] = useState(null);
-  const [thumbs, setThumbs] = useState({}); // id -> object URL
-
-  useEffect(() => {
-    if (!selectedId && properties.length) setSelectedId(properties[0].id);
-  }, [properties]);
-
-  const propDocs = documents.filter((d) => d.propertyId === selectedId);
-
-  useEffect(() => {
-    // load thumbnails for image files
-    let cancelled = false;
-    (async () => {
-      for (const doc of propDocs) {
-        if (
-          doc.storage === "local" &&
-          doc.fileType?.startsWith("image/") &&
-          !thumbs[doc.id]
-        ) {
-          const rec = await getFileBlob(doc.id);
-          if (rec && !cancelled) {
-            const url = URL.createObjectURL(rec.blob);
-            setThumbs((t) => ({ ...t, [doc.id]: url }));
-          }
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [propDocs.length, selectedId]);
-
-  async function addDocument() {
-    if (!selectedId) {
-      showToast("Select a property first");
-      return;
-    }
-    if (!label) {
-      showToast("Give this document a name");
-      return;
-    }
-    if (mode === "link") {
-      if (!externalUrl) {
-        showToast("Paste a link");
-        return;
-      }
-      setDocuments([
-        ...documents,
-        {
-          id: uid(),
-          propertyId: selectedId,
-          label,
-          docType,
-          storage: "link",
-          externalUrl,
-          addedAt: new Date().toISOString(),
-        },
-      ]);
-      setLabel("");
-      setExternalUrl("");
-      showToast("Link saved");
-    } else {
-      if (!pendingFile) {
-        showToast("Choose a file");
-        return;
-      }
-      const id = uid();
-      await saveFileBlob(id, pendingFile, pendingFile.name, pendingFile.type);
-      setDocuments([
-        ...documents,
-        {
-          id,
-          propertyId: selectedId,
-          label,
-          docType,
-          storage: "local",
-          fileName: pendingFile.name,
-          fileType: pendingFile.type,
-          addedAt: new Date().toISOString(),
-        },
-      ]);
-      setLabel("");
-      setPendingFile(null);
-      showToast("File uploaded");
-    }
-  }
-
-  async function openDoc(doc) {
-    if (doc.storage === "link") {
-      window.open(doc.externalUrl, "_blank");
-      return;
-    }
-    const rec = await getFileBlob(doc.id);
-    if (rec) {
-      const url = URL.createObjectURL(rec.blob);
-      window.open(url, "_blank");
-    } else {
-      showToast("File not found in this browser");
-    }
-  }
-
-  async function removeDoc(doc) {
-    if (doc.storage === "local") await deleteFileBlob(doc.id);
-    setDocuments(documents.filter((d) => d.id !== doc.id));
-  }
-
-  return (
-    <div>
-      <h1 className="amble-display text-3xl mb-2">Property documents</h1>
-      <p className="text-sm mb-6" style={{ color: COLORS.warmgray }}>
-        Uploaded files are stored only in this browser. For anything important —
-        signed contracts especially — use "Paste a link" to a Google
-        Drive/Dropbox file instead, so it's safely backed up off this device.
-      </p>
-
-      <select
-        value={selectedId}
-        onChange={(e) => setSelectedId(e.target.value)}
-        className="text-sm px-3 py-2 rounded-md border mb-6"
-        style={{ borderColor: COLORS.sand }}
-      >
-        {properties.length === 0 && <option>No properties yet</option>}
-        {properties.map((p) => (
-          <option key={p.id} value={p.id}>
-            {p.name}
-          </option>
-        ))}
-      </select>
-
-      {properties.length === 0 ? (
-        <Card>
-          <p className="text-sm" style={{ color: COLORS.warmgray }}>
-            Add a property first.
-          </p>
-        </Card>
-      ) : (
-        <div className="grid grid-cols-2 gap-6">
-          <Card>
-            <h3 className="text-sm font-medium mb-4">Add a document</h3>
-            <div className="space-y-3">
-              <Field label="Type">
-                <select
-                  value={docType}
-                  onChange={(e) => setDocType(e.target.value)}
-                  className="w-full text-sm px-3 py-2 rounded-md border"
-                  style={{ borderColor: COLORS.sand }}
-                >
-                  <option value="photo">Photo</option>
-                  <option value="contract">Signed contract</option>
-                  <option value="id">Owner ID / FICA doc</option>
-                  <option value="other">Other</option>
-                </select>
-              </Field>
-              <Field label="Name / description">
-                <input
-                  value={label}
-                  onChange={(e) => setLabel(e.target.value)}
-                  placeholder="e.g. Lease agreement 2026"
-                  className="w-full text-sm px-3 py-2 rounded-md border"
-                  style={{ borderColor: COLORS.sand }}
-                />
-              </Field>
-
-              <div className="flex gap-2 text-xs">
-                <button
-                  onClick={() => setMode("upload")}
-                  className="flex-1 py-1.5 rounded-md flex items-center justify-center gap-1"
-                  style={{
-                    background: mode === "upload" ? COLORS.teal : "transparent",
-                    color:
-                      mode === "upload" ? COLORS.offwhite : COLORS.charcoal,
-                    border: `1px solid ${COLORS.sand}`,
-                  }}
-                >
-                  <Upload size={13} /> Upload file
-                </button>
-                <button
-                  onClick={() => setMode("link")}
-                  className="flex-1 py-1.5 rounded-md flex items-center justify-center gap-1"
-                  style={{
-                    background: mode === "link" ? COLORS.teal : "transparent",
-                    color: mode === "link" ? COLORS.offwhite : COLORS.charcoal,
-                    border: `1px solid ${COLORS.sand}`,
-                  }}
-                >
-                  <LinkIcon size={13} /> Paste a link
-                </button>
-              </div>
-
-              {mode === "upload" ? (
-                <Field label="File">
-                  <input
-                    type="file"
-                    onChange={(e) => setPendingFile(e.target.files[0])}
-                    className="w-full text-sm"
-                  />
-                </Field>
-              ) : (
-                <Field label="Google Drive / Dropbox link">
-                  <input
-                    value={externalUrl}
-                    onChange={(e) => setExternalUrl(e.target.value)}
-                    placeholder="https://drive.google.com/..."
-                    className="w-full text-sm px-3 py-2 rounded-md border"
-                    style={{ borderColor: COLORS.sand }}
-                  />
-                </Field>
-              )}
-
-              <button
-                onClick={addDocument}
-                className="w-full text-sm py-2 rounded-md"
-                style={{ background: COLORS.teal, color: COLORS.offwhite }}
-              >
-                Save document
-              </button>
-            </div>
-          </Card>
-
-          <div className="space-y-3">
-            {propDocs.length === 0 && (
-              <Card>
-                <p className="text-sm" style={{ color: COLORS.warmgray }}>
-                  No documents for this property yet.
-                </p>
-              </Card>
-            )}
-            {propDocs.map((doc) => (
-              <Card key={doc.id}>
-                <div className="flex justify-between items-center">
-                  <div className="flex items-center gap-3">
-                    {thumbs[doc.id] ? (
-                      <img
-                        src={thumbs[doc.id]}
-                        alt=""
-                        className="w-10 h-10 object-cover rounded"
-                      />
-                    ) : doc.docType === "photo" ? (
-                      <ImageIcon size={18} color={COLORS.warmgray} />
-                    ) : (
-                      <FileText size={18} color={COLORS.warmgray} />
-                    )}
-                    <div>
-                      <div className="text-sm font-medium">{doc.label}</div>
-                      <div
-                        className="text-xs"
-                        style={{ color: COLORS.warmgray }}
-                      >
-                        {doc.docType} ·{" "}
-                        {doc.storage === "link"
-                          ? "external link"
-                          : "stored in browser"}
-                      </div>
-                    </div>
-                  </div>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => openDoc(doc)}
-                      className="text-xs px-2 py-1 rounded border"
-                      style={{ borderColor: COLORS.sand }}
-                    >
-                      Open
-                    </button>
-                    <button
-                      onClick={() => removeDoc(doc)}
-                      className="text-xs px-2 py-1 rounded"
-                      style={{ color: COLORS.terracotta }}
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                </div>
-              </Card>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
 function Pricing({
   properties,
   comps,
@@ -1038,6 +886,7 @@ function Pricing({
   monthIdx,
   setMonthIdx,
   pricingByProperty,
+  userId,
   showToast,
 }) {
   const [selectedId, setSelectedId] = useState(properties[0]?.id || "");
@@ -1046,7 +895,6 @@ function Pricing({
     bedrooms: 1,
     price: "",
   });
-
   useEffect(() => {
     if (!selectedId && properties.length) setSelectedId(properties[0].id);
   }, [properties]);
@@ -1055,24 +903,25 @@ function Pricing({
   const pricing = property ? pricingByProperty[property.id] : null;
   const relevantComps = property
     ? comps.filter(
-        (c) => c.suburb.toLowerCase() === property.suburb.toLowerCase(),
+        (c) => (c.suburb || "").toLowerCase() === property.suburb.toLowerCase(),
       )
     : [];
 
-  function addComp() {
+  async function addComp() {
     if (!compForm.suburb || !compForm.price) {
       showToast("Suburb and price required");
       return;
     }
-    setComps([
-      ...comps,
-      {
-        id: uid(),
-        ...compForm,
-        source: "manual",
-        date: new Date().toISOString(),
-      },
-    ]);
+    const { data, error } = await supabase
+      .from("comps")
+      .insert({ ...compForm, source: "manual", user_id: userId })
+      .select()
+      .single();
+    if (error) {
+      showToast("Error adding comp");
+      return;
+    }
+    setComps([...comps, data]);
     setCompForm({ suburb: property?.suburb || "", bedrooms: 1, price: "" });
     showToast("Comp added");
   }
@@ -1107,11 +956,10 @@ function Pricing({
           ))}
         </select>
       </div>
-
       {!property ? (
         <Card>
           <p className="text-sm" style={{ color: COLORS.warmgray }}>
-            Add a property first to see pricing recommendations.
+            Add a property first.
           </p>
         </Card>
       ) : (
@@ -1122,7 +970,7 @@ function Pricing({
             </div>
             <div className="amble-display text-2xl">R{pricing.min}</div>
           </Card>
-          <Card className="ring-2" style={{ borderColor: COLORS.teal }}>
+          <Card>
             <div className="text-xs mb-1" style={{ color: COLORS.warmgray }}>
               Optimal ({pricing.season.label})
             </div>
@@ -1141,7 +989,6 @@ function Pricing({
           </Card>
         </div>
       )}
-
       {property && (
         <Card className="mb-6">
           <div className="grid grid-cols-3 gap-4 text-sm">
@@ -1164,7 +1011,6 @@ function Pricing({
           </div>
         </Card>
       )}
-
       <Card>
         <h3 className="text-sm font-medium mb-3">
           Market comps for {property?.suburb || "this area"}
@@ -1223,8 +1069,7 @@ function Pricing({
           ))}
           {relevantComps.length === 0 && (
             <p className="text-xs" style={{ color: COLORS.warmgray }}>
-              No comps logged yet for this suburb — add a few to sharpen the
-              recommendation.
+              No comps logged yet for this suburb.
             </p>
           )}
         </div>
@@ -1233,31 +1078,39 @@ function Pricing({
   );
 }
 
-function Bookings({ properties, bookings, setBookings, showToast }) {
+function Bookings({ properties, bookings, setBookings, userId, showToast }) {
   const [form, setForm] = useState({
-    propertyId: "",
-    checkIn: "",
-    checkOut: "",
+    property_id: "",
+    check_in: "",
+    check_out: "",
     rate: "",
     platform: "Airbnb",
   });
-
   useEffect(() => {
-    if (!form.propertyId && properties.length)
-      setForm((f) => ({ ...f, propertyId: properties[0].id }));
+    if (!form.property_id && properties.length)
+      setForm((f) => ({ ...f, property_id: properties[0].id }));
   }, [properties]);
 
-  function addBooking() {
-    if (!form.propertyId || !form.checkIn || !form.checkOut || !form.rate) {
+  async function addBooking() {
+    if (!form.property_id || !form.check_in || !form.check_out || !form.rate) {
       showToast("All fields required");
       return;
     }
-    setBookings([...bookings, { id: uid(), ...form }]);
+    const { data, error } = await supabase
+      .from("bookings")
+      .insert({ ...form, user_id: userId })
+      .select()
+      .single();
+    if (error) {
+      showToast("Error logging booking");
+      return;
+    }
+    setBookings([...bookings, data]);
     showToast("Booking logged");
-    setForm({ ...form, checkIn: "", checkOut: "", rate: "" });
+    setForm({ ...form, check_in: "", check_out: "", rate: "" });
   }
-
-  function remove(id) {
+  async function remove(id) {
+    await supabase.from("bookings").delete().eq("id", id);
     setBookings(bookings.filter((b) => b.id !== id));
   }
 
@@ -1268,8 +1121,8 @@ function Bookings({ properties, bookings, setBookings, showToast }) {
         <h3 className="text-sm font-medium mb-3">Log a booking</h3>
         <div className="grid grid-cols-5 gap-2">
           <select
-            value={form.propertyId}
-            onChange={(e) => setForm({ ...form, propertyId: e.target.value })}
+            value={form.property_id}
+            onChange={(e) => setForm({ ...form, property_id: e.target.value })}
             className="text-sm px-2 py-2 rounded-md border"
             style={{ borderColor: COLORS.sand }}
           >
@@ -1281,15 +1134,15 @@ function Bookings({ properties, bookings, setBookings, showToast }) {
           </select>
           <input
             type="date"
-            value={form.checkIn}
-            onChange={(e) => setForm({ ...form, checkIn: e.target.value })}
+            value={form.check_in}
+            onChange={(e) => setForm({ ...form, check_in: e.target.value })}
             className="text-sm px-2 py-2 rounded-md border"
             style={{ borderColor: COLORS.sand }}
           />
           <input
             type="date"
-            value={form.checkOut}
-            onChange={(e) => setForm({ ...form, checkOut: e.target.value })}
+            value={form.check_out}
+            onChange={(e) => setForm({ ...form, check_out: e.target.value })}
             className="text-sm px-2 py-2 rounded-md border"
             style={{ borderColor: COLORS.sand }}
           />
@@ -1320,7 +1173,6 @@ function Bookings({ properties, bookings, setBookings, showToast }) {
           Log booking
         </button>
       </Card>
-
       <Card>
         <h3 className="text-sm font-medium mb-3">All bookings</h3>
         <div className="space-y-1">
@@ -1330,11 +1182,11 @@ function Bookings({ properties, bookings, setBookings, showToast }) {
             </p>
           )}
           {bookings.map((b) => {
-            const p = properties.find((p) => p.id === b.propertyId);
+            const p = properties.find((p) => p.id === b.property_id);
             const nights = Math.max(
               1,
               Math.round(
-                (new Date(b.checkOut) - new Date(b.checkIn)) / 86400000,
+                (new Date(b.check_out) - new Date(b.check_in)) / 86400000,
               ),
             );
             return (
@@ -1344,8 +1196,8 @@ function Bookings({ properties, bookings, setBookings, showToast }) {
                 style={{ borderColor: COLORS.sand }}
               >
                 <span>
-                  {p?.name || "Unknown"} · {b.checkIn} → {b.checkOut} ({nights}
-                  n) · {b.platform}
+                  {p?.name || "Unknown"} · {b.check_in} → {b.check_out} (
+                  {nights}n) · {b.platform}
                 </span>
                 <div className="flex items-center gap-3">
                   <span>R{b.rate}/night</span>
@@ -1365,25 +1217,39 @@ function Bookings({ properties, bookings, setBookings, showToast }) {
   );
 }
 
-function ListingScore({ properties, scores, setScores, showToast }) {
+function ListingScore({ properties, scores, setScores, userId, showToast }) {
   const [selectedId, setSelectedId] = useState(properties[0]?.id || "");
   useEffect(() => {
     if (!selectedId && properties.length) setSelectedId(properties[0].id);
   }, [properties]);
 
   const current = scores[selectedId] || {
-    photoCount: 0,
-    titleOptimized: false,
-    amenityCount: 0,
-    instantBook: false,
-    responseUnderHour: false,
-    responseUnderDay: false,
+    photo_count: 0,
+    title_optimized: false,
+    amenity_count: 0,
+    instant_book: false,
+    response_under_hour: false,
+    response_under_day: false,
   };
   const result = scoreListing(current);
 
-  function update(field, value) {
-    const next = { ...current, [field]: value };
-    setScores({ ...scores, [selectedId]: next });
+  async function update(field, value) {
+    const next = {
+      ...current,
+      [field]: value,
+      property_id: selectedId,
+      user_id: userId,
+    };
+    const { data, error } = await supabase
+      .from("listing_scores")
+      .upsert(next, { onConflict: "property_id" })
+      .select()
+      .single();
+    if (error) {
+      showToast("Error saving");
+      return;
+    }
+    setScores({ ...scores, [selectedId]: data });
   }
 
   const suggestions = [];
@@ -1391,16 +1257,9 @@ function ListingScore({ properties, scores, setScores, showToast }) {
     suggestions.push("Add more high-quality photos (aim for 20+).");
   if (result.title < 20)
     suggestions.push("Optimize the title with keywords guests search for.");
-  if (result.amenity < 20)
-    suggestions.push(
-      "List more amenities — every one counts toward search ranking.",
-    );
-  if (result.instant === 0)
-    suggestions.push(
-      "Turn on Instant Book — it meaningfully boosts visibility.",
-    );
-  if (result.response < 20)
-    suggestions.push("Get response time under 1 hour to protect your ranking.");
+  if (result.amenity < 20) suggestions.push("List more amenities.");
+  if (result.instant === 0) suggestions.push("Turn on Instant Book.");
+  if (result.response < 20) suggestions.push("Get response time under 1 hour.");
 
   return (
     <div>
@@ -1418,7 +1277,6 @@ function ListingScore({ properties, scores, setScores, showToast }) {
           </option>
         ))}
       </select>
-
       {properties.length === 0 ? (
         <Card>
           <p className="text-sm" style={{ color: COLORS.warmgray }}>
@@ -1429,32 +1287,14 @@ function ListingScore({ properties, scores, setScores, showToast }) {
         <div className="grid grid-cols-2 gap-6">
           <Card>
             <div className="space-y-4">
-              <Field label={`Photo count (${current.photoCount || 0})`}>
+              <Field label={`Photo count (${current.photo_count || 0})`}>
                 <input
                   type="range"
                   min="0"
                   max="30"
-                  value={current.photoCount || 0}
-                  onChange={(e) => update("photoCount", Number(e.target.value))}
-                  className="w-full"
-                />
-              </Field>
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={!!current.titleOptimized}
-                  onChange={(e) => update("titleOptimized", e.target.checked)}
-                />{" "}
-                Title & description are optimized with keywords
-              </label>
-              <Field label={`Amenities listed (${current.amenityCount || 0})`}>
-                <input
-                  type="range"
-                  min="0"
-                  max="15"
-                  value={current.amenityCount || 0}
+                  value={current.photo_count || 0}
                   onChange={(e) =>
-                    update("amenityCount", Number(e.target.value))
+                    update("photo_count", Number(e.target.value))
                   }
                   className="w-full"
                 />
@@ -1462,24 +1302,43 @@ function ListingScore({ properties, scores, setScores, showToast }) {
               <label className="flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"
-                  checked={!!current.instantBook}
-                  onChange={(e) => update("instantBook", e.target.checked)}
+                  checked={!!current.title_optimized}
+                  onChange={(e) => update("title_optimized", e.target.checked)}
+                />{" "}
+                Title & description optimized
+              </label>
+              <Field label={`Amenities listed (${current.amenity_count || 0})`}>
+                <input
+                  type="range"
+                  min="0"
+                  max="15"
+                  value={current.amenity_count || 0}
+                  onChange={(e) =>
+                    update("amenity_count", Number(e.target.value))
+                  }
+                  className="w-full"
+                />
+              </Field>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={!!current.instant_book}
+                  onChange={(e) => update("instant_book", e.target.checked)}
                 />{" "}
                 Instant Book enabled
               </label>
               <label className="flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"
-                  checked={!!current.responseUnderHour}
+                  checked={!!current.response_under_hour}
                   onChange={(e) =>
-                    update("responseUnderHour", e.target.checked)
+                    update("response_under_hour", e.target.checked)
                   }
                 />{" "}
                 Response time under 1 hour
               </label>
             </div>
           </Card>
-
           <div>
             <Card className="mb-4 text-center">
               <div className="text-xs mb-1" style={{ color: COLORS.warmgray }}>
@@ -1507,9 +1366,7 @@ function ListingScore({ properties, scores, setScores, showToast }) {
                 <h3 className="text-sm font-medium mb-2">Suggestions</h3>
                 <ul className="text-sm space-y-1.5">
                   {suggestions.map((s, i) => (
-                    <li key={i} style={{ color: COLORS.charcoal }}>
-                      · {s}
-                    </li>
+                    <li key={i}>· {s}</li>
                   ))}
                 </ul>
               </Card>
@@ -1517,6 +1374,640 @@ function ListingScore({ properties, scores, setScores, showToast }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function Documents({ properties, documents, setDocuments, userId, showToast }) {
+  const [selectedId, setSelectedId] = useState(properties[0]?.id || "");
+  const [docType, setDocType] = useState("photo");
+  const [mode, setMode] = useState("upload");
+  const [label, setLabel] = useState("");
+  const [externalUrl, setExternalUrl] = useState("");
+  const [pendingFile, setPendingFile] = useState(null);
+  useEffect(() => {
+    if (!selectedId && properties.length) setSelectedId(properties[0].id);
+  }, [properties]);
+
+  const propDocs = documents.filter((d) => d.property_id === selectedId);
+
+  async function addDocument() {
+    if (!selectedId) {
+      showToast("Select a property first");
+      return;
+    }
+    if (!label) {
+      showToast("Give this document a name");
+      return;
+    }
+    if (mode === "link") {
+      if (!externalUrl) {
+        showToast("Paste a link");
+        return;
+      }
+      const { data, error } = await supabase
+        .from("documents")
+        .insert({
+          property_id: selectedId,
+          user_id: userId,
+          label,
+          doc_type: docType,
+          storage_kind: "link",
+          external_url: externalUrl,
+        })
+        .select()
+        .single();
+      if (error) {
+        showToast("Error saving");
+        return;
+      }
+      setDocuments([data, ...documents]);
+      setLabel("");
+      setExternalUrl("");
+      showToast("Link saved");
+    } else {
+      if (!pendingFile) {
+        showToast("Choose a file");
+        return;
+      }
+      const path = `${userId}/${crypto.randomUUID()}-${pendingFile.name}`;
+      const { error: upErr } = await supabase.storage
+        .from("documents")
+        .upload(path, pendingFile);
+      if (upErr) {
+        showToast("Upload failed: " + upErr.message);
+        return;
+      }
+      const { data, error } = await supabase
+        .from("documents")
+        .insert({
+          property_id: selectedId,
+          user_id: userId,
+          label,
+          doc_type: docType,
+          storage_kind: "file",
+          file_path: path,
+          file_name: pendingFile.name,
+        })
+        .select()
+        .single();
+      if (error) {
+        showToast("Error saving");
+        return;
+      }
+      setDocuments([data, ...documents]);
+      setLabel("");
+      setPendingFile(null);
+      showToast("File uploaded");
+    }
+  }
+
+  async function openDoc(doc) {
+    if (doc.storage_kind === "link") {
+      window.open(doc.external_url, "_blank");
+      return;
+    }
+    const { data, error } = await supabase.storage
+      .from("documents")
+      .createSignedUrl(doc.file_path, 3600);
+    if (error) {
+      showToast("Could not open file");
+      return;
+    }
+    window.open(data.signedUrl, "_blank");
+  }
+
+  async function removeDoc(doc) {
+    if (doc.storage_kind === "file")
+      await supabase.storage.from("documents").remove([doc.file_path]);
+    await supabase.from("documents").delete().eq("id", doc.id);
+    setDocuments(documents.filter((d) => d.id !== doc.id));
+  }
+
+  return (
+    <div>
+      <h1 className="amble-display text-3xl mb-2">Property documents</h1>
+      <p className="text-sm mb-6" style={{ color: COLORS.warmgray }}>
+        Files are stored securely in your account and follow you to any browser
+        or device you log in from.
+      </p>
+      <select
+        value={selectedId}
+        onChange={(e) => setSelectedId(e.target.value)}
+        className="text-sm px-3 py-2 rounded-md border mb-6"
+        style={{ borderColor: COLORS.sand }}
+      >
+        {properties.length === 0 && <option>No properties yet</option>}
+        {properties.map((p) => (
+          <option key={p.id} value={p.id}>
+            {p.name}
+          </option>
+        ))}
+      </select>
+      {properties.length === 0 ? (
+        <Card>
+          <p className="text-sm" style={{ color: COLORS.warmgray }}>
+            Add a property first.
+          </p>
+        </Card>
+      ) : (
+        <div className="grid grid-cols-2 gap-6">
+          <Card>
+            <h3 className="text-sm font-medium mb-4">Add a document</h3>
+            <div className="space-y-3">
+              <Field label="Type">
+                <select
+                  value={docType}
+                  onChange={(e) => setDocType(e.target.value)}
+                  className="w-full text-sm px-3 py-2 rounded-md border"
+                  style={{ borderColor: COLORS.sand }}
+                >
+                  <option value="photo">Photo</option>
+                  <option value="contract">Signed contract</option>
+                  <option value="id">Owner ID / FICA doc</option>
+                  <option value="other">Other</option>
+                </select>
+              </Field>
+              <Field label="Name / description">
+                <input
+                  value={label}
+                  onChange={(e) => setLabel(e.target.value)}
+                  placeholder="e.g. Lease agreement 2026"
+                  className="w-full text-sm px-3 py-2 rounded-md border"
+                  style={{ borderColor: COLORS.sand }}
+                />
+              </Field>
+              <div className="flex gap-2 text-xs">
+                <button
+                  onClick={() => setMode("upload")}
+                  className="flex-1 py-1.5 rounded-md flex items-center justify-center gap-1"
+                  style={{
+                    background: mode === "upload" ? COLORS.teal : "transparent",
+                    color:
+                      mode === "upload" ? COLORS.offwhite : COLORS.charcoal,
+                    border: `1px solid ${COLORS.sand}`,
+                  }}
+                >
+                  <Upload size={13} /> Upload file
+                </button>
+                <button
+                  onClick={() => setMode("link")}
+                  className="flex-1 py-1.5 rounded-md flex items-center justify-center gap-1"
+                  style={{
+                    background: mode === "link" ? COLORS.teal : "transparent",
+                    color: mode === "link" ? COLORS.offwhite : COLORS.charcoal,
+                    border: `1px solid ${COLORS.sand}`,
+                  }}
+                >
+                  <LinkIcon size={13} /> Paste a link
+                </button>
+              </div>
+              {mode === "upload" ? (
+                <Field label="File">
+                  <input
+                    type="file"
+                    onChange={(e) => setPendingFile(e.target.files[0])}
+                    className="w-full text-sm"
+                  />
+                </Field>
+              ) : (
+                <Field label="Google Drive / Dropbox link">
+                  <input
+                    value={externalUrl}
+                    onChange={(e) => setExternalUrl(e.target.value)}
+                    placeholder="https://drive.google.com/..."
+                    className="w-full text-sm px-3 py-2 rounded-md border"
+                    style={{ borderColor: COLORS.sand }}
+                  />
+                </Field>
+              )}
+              <button
+                onClick={addDocument}
+                className="w-full text-sm py-2 rounded-md"
+                style={{ background: COLORS.teal, color: COLORS.offwhite }}
+              >
+                Save document
+              </button>
+            </div>
+          </Card>
+          <div className="space-y-3">
+            {propDocs.length === 0 && (
+              <Card>
+                <p className="text-sm" style={{ color: COLORS.warmgray }}>
+                  No documents for this property yet.
+                </p>
+              </Card>
+            )}
+            {propDocs.map((doc) => (
+              <Card key={doc.id}>
+                <div className="flex justify-between items-center">
+                  <div className="flex items-center gap-3">
+                    <FileText size={18} color={COLORS.warmgray} />
+                    <div>
+                      <div className="text-sm font-medium">{doc.label}</div>
+                      <div
+                        className="text-xs"
+                        style={{ color: COLORS.warmgray }}
+                      >
+                        {doc.doc_type} ·{" "}
+                        {doc.storage_kind === "link"
+                          ? "external link"
+                          : "stored in your account"}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => openDoc(doc)}
+                      className="text-xs px-2 py-1 rounded border"
+                      style={{ borderColor: COLORS.sand }}
+                    >
+                      Open
+                    </button>
+                    <button
+                      onClick={() => removeDoc(doc)}
+                      className="text-xs px-2 py-1 rounded"
+                      style={{ color: COLORS.terracotta }}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                </div>
+              </Card>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const FINANCE_CATEGORIES = [
+  "Commission income",
+  "Cleaning cost",
+  "Marketing",
+  "Subscriptions/software",
+  "Insurance",
+  "Accounting",
+  "Owner salary draw",
+  "Other",
+];
+
+function Finance({
+  properties,
+  financeEntries,
+  setFinanceEntries,
+  userId,
+  showToast,
+}) {
+  const empty = {
+    entry_date: new Date().toISOString().slice(0, 10),
+    entry_type: "income",
+    category: FINANCE_CATEGORIES[0],
+    amount: "",
+    property_id: "",
+    notes: "",
+  };
+  const [form, setForm] = useState(empty);
+
+  async function addEntry() {
+    if (!form.amount) {
+      showToast("Amount required");
+      return;
+    }
+    const payload = {
+      ...form,
+      user_id: userId,
+      property_id: form.property_id || null,
+      amount: Number(form.amount),
+    };
+    const { data, error } = await supabase
+      .from("finance_entries")
+      .insert(payload)
+      .select()
+      .single();
+    if (error) {
+      showToast("Error saving");
+      return;
+    }
+    setFinanceEntries([data, ...financeEntries]);
+    setForm(empty);
+    showToast("Entry logged");
+  }
+  async function remove(id) {
+    await supabase.from("finance_entries").delete().eq("id", id);
+    setFinanceEntries(financeEntries.filter((e) => e.id !== id));
+  }
+
+  const now = new Date();
+  const thisMonthEntries = financeEntries.filter((e) => {
+    const d = new Date(e.entry_date);
+    return (
+      d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear()
+    );
+  });
+  const income = thisMonthEntries
+    .filter((e) => e.entry_type === "income")
+    .reduce((s, e) => s + Number(e.amount), 0);
+  const expenses = thisMonthEntries
+    .filter((e) => e.entry_type === "expense")
+    .reduce((s, e) => s + Number(e.amount), 0);
+  const salaryDrawn = thisMonthEntries
+    .filter((e) => e.category === "Owner salary draw")
+    .reduce((s, e) => s + Number(e.amount), 0);
+  const salaryPct = Math.min(100, (salaryDrawn / 35000) * 100);
+
+  return (
+    <div>
+      <h1 className="amble-display text-3xl mb-6">Finance tracker</h1>
+      <div className="grid grid-cols-3 gap-4 mb-6">
+        <StatCard
+          label="Income this month"
+          value={`R${income.toLocaleString()}`}
+        />
+        <StatCard
+          label="Expenses this month"
+          value={`R${expenses.toLocaleString()}`}
+        />
+        <StatCard
+          label="Net this month"
+          value={`R${(income - expenses).toLocaleString()}`}
+          accent
+        />
+      </div>
+      <Card className="mb-6">
+        <div className="flex justify-between text-sm mb-2">
+          <span>Owner salary drawn this month</span>
+          <span>R{salaryDrawn.toLocaleString()} / R35,000</span>
+        </div>
+        <div
+          className="w-full h-2 rounded-full"
+          style={{ background: COLORS.sand }}
+        >
+          <div
+            className="h-2 rounded-full"
+            style={{ width: `${salaryPct}%`, background: COLORS.teal }}
+          />
+        </div>
+      </Card>
+      <Card className="mb-6">
+        <h3 className="text-sm font-medium mb-3">Log an entry</h3>
+        <div className="grid grid-cols-3 gap-2 mb-2">
+          <select
+            value={form.entry_type}
+            onChange={(e) => setForm({ ...form, entry_type: e.target.value })}
+            className="text-sm px-2 py-2 rounded-md border"
+            style={{ borderColor: COLORS.sand }}
+          >
+            <option value="income">Income</option>
+            <option value="expense">Expense</option>
+          </select>
+          <select
+            value={form.category}
+            onChange={(e) => setForm({ ...form, category: e.target.value })}
+            className="text-sm px-2 py-2 rounded-md border"
+            style={{ borderColor: COLORS.sand }}
+          >
+            {FINANCE_CATEGORIES.map((c) => (
+              <option key={c}>{c}</option>
+            ))}
+          </select>
+          <input
+            type="number"
+            placeholder="Amount (R)"
+            value={form.amount}
+            onChange={(e) => setForm({ ...form, amount: e.target.value })}
+            className="text-sm px-2 py-2 rounded-md border"
+            style={{ borderColor: COLORS.sand }}
+          />
+        </div>
+        <div className="grid grid-cols-3 gap-2 mb-2">
+          <input
+            type="date"
+            value={form.entry_date}
+            onChange={(e) => setForm({ ...form, entry_date: e.target.value })}
+            className="text-sm px-2 py-2 rounded-md border"
+            style={{ borderColor: COLORS.sand }}
+          />
+          <select
+            value={form.property_id}
+            onChange={(e) => setForm({ ...form, property_id: e.target.value })}
+            className="text-sm px-2 py-2 rounded-md border"
+            style={{ borderColor: COLORS.sand }}
+          >
+            <option value="">No specific property</option>
+            {properties.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+          <input
+            placeholder="Notes (optional)"
+            value={form.notes}
+            onChange={(e) => setForm({ ...form, notes: e.target.value })}
+            className="text-sm px-2 py-2 rounded-md border"
+            style={{ borderColor: COLORS.sand }}
+          />
+        </div>
+        <button
+          onClick={addEntry}
+          className="text-sm px-4 py-2 rounded-md"
+          style={{ background: COLORS.teal, color: COLORS.offwhite }}
+        >
+          Log entry
+        </button>
+      </Card>
+      <Card>
+        <h3 className="text-sm font-medium mb-3">All entries</h3>
+        <div className="space-y-1">
+          {financeEntries.length === 0 && (
+            <p className="text-xs" style={{ color: COLORS.warmgray }}>
+              No entries yet.
+            </p>
+          )}
+          {financeEntries.map((e) => (
+            <div
+              key={e.id}
+              className="flex justify-between items-center text-sm py-2 border-b last:border-0"
+              style={{ borderColor: COLORS.sand }}
+            >
+              <span>
+                {e.entry_date} · {e.category}
+                {e.notes ? ` · ${e.notes}` : ""}
+              </span>
+              <div className="flex items-center gap-3">
+                <span
+                  style={{
+                    color:
+                      e.entry_type === "income"
+                        ? COLORS.teal
+                        : COLORS.terracotta,
+                  }}
+                >
+                  {e.entry_type === "income" ? "+" : "−"}R
+                  {Number(e.amount).toLocaleString()}
+                </span>
+                <button
+                  onClick={() => remove(e.id)}
+                  style={{ color: COLORS.terracotta }}
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function SalesPipeline({ leads, setLeads, userId, showToast }) {
+  const empty = {
+    owner_name: "",
+    contact: "",
+    property_area: "",
+    stage: "new",
+    notes: "",
+  };
+  const [form, setForm] = useState(empty);
+
+  async function addLead() {
+    if (!form.owner_name) {
+      showToast("Owner name required");
+      return;
+    }
+    const { data, error } = await supabase
+      .from("sales_leads")
+      .insert({ ...form, user_id: userId })
+      .select()
+      .single();
+    if (error) {
+      showToast("Error saving");
+      return;
+    }
+    setLeads([data, ...leads]);
+    setForm(empty);
+    showToast("Lead added");
+  }
+  async function moveStage(lead, stage) {
+    const { data, error } = await supabase
+      .from("sales_leads")
+      .update({ stage })
+      .eq("id", lead.id)
+      .select()
+      .single();
+    if (error) return;
+    setLeads(leads.map((l) => (l.id === lead.id ? data : l)));
+  }
+  async function remove(id) {
+    await supabase.from("sales_leads").delete().eq("id", id);
+    setLeads(leads.filter((l) => l.id !== id));
+  }
+
+  return (
+    <div>
+      <h1 className="amble-display text-3xl mb-6">Sales pipeline</h1>
+      <Card className="mb-6">
+        <h3 className="text-sm font-medium mb-3">Add a lead</h3>
+        <div className="grid grid-cols-4 gap-2 mb-2">
+          <input
+            placeholder="Owner name"
+            value={form.owner_name}
+            onChange={(e) => setForm({ ...form, owner_name: e.target.value })}
+            className="text-sm px-2 py-2 rounded-md border"
+            style={{ borderColor: COLORS.sand }}
+          />
+          <input
+            placeholder="Contact (phone/email)"
+            value={form.contact}
+            onChange={(e) => setForm({ ...form, contact: e.target.value })}
+            className="text-sm px-2 py-2 rounded-md border"
+            style={{ borderColor: COLORS.sand }}
+          />
+          <input
+            placeholder="Property area"
+            value={form.property_area}
+            onChange={(e) =>
+              setForm({ ...form, property_area: e.target.value })
+            }
+            className="text-sm px-2 py-2 rounded-md border"
+            style={{ borderColor: COLORS.sand }}
+          />
+          <input
+            placeholder="Notes"
+            value={form.notes}
+            onChange={(e) => setForm({ ...form, notes: e.target.value })}
+            className="text-sm px-2 py-2 rounded-md border"
+            style={{ borderColor: COLORS.sand }}
+          />
+        </div>
+        <button
+          onClick={addLead}
+          className="text-sm px-4 py-2 rounded-md"
+          style={{ background: COLORS.teal, color: COLORS.offwhite }}
+        >
+          Add lead
+        </button>
+      </Card>
+      <div className="grid grid-cols-5 gap-3">
+        {STAGES.map((stage) => (
+          <div key={stage}>
+            <div
+              className="text-xs font-medium mb-2 px-1"
+              style={{ color: COLORS.warmgray }}
+            >
+              {STAGE_LABELS[stage]} (
+              {leads.filter((l) => l.stage === stage).length})
+            </div>
+            <div className="space-y-2">
+              {leads
+                .filter((l) => l.stage === stage)
+                .map((l) => (
+                  <Card key={l.id} className="!p-3">
+                    <div className="text-sm font-medium">{l.owner_name}</div>
+                    {l.property_area && (
+                      <div
+                        className="text-xs"
+                        style={{ color: COLORS.warmgray }}
+                      >
+                        {l.property_area}
+                      </div>
+                    )}
+                    {l.contact && (
+                      <div
+                        className="text-xs"
+                        style={{ color: COLORS.warmgray }}
+                      >
+                        {l.contact}
+                      </div>
+                    )}
+                    <select
+                      value={l.stage}
+                      onChange={(e) => moveStage(l, e.target.value)}
+                      className="w-full text-xs mt-2 px-1 py-1 rounded border"
+                      style={{ borderColor: COLORS.sand }}
+                    >
+                      {STAGES.map((s) => (
+                        <option key={s} value={s}>
+                          {STAGE_LABELS[s]}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      onClick={() => remove(l.id)}
+                      className="text-xs mt-2"
+                      style={{ color: COLORS.terracotta }}
+                    >
+                      Remove
+                    </button>
+                  </Card>
+                ))}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
